@@ -1,0 +1,4 @@
+timestamp,cpu_info,nthreads,requested_points,grid_dim,actual_points,points_found,found_percentage,computation_time,min_time,max_time,avg_time,num_runs
+2025-12-09 14:08:07,"Intel(R) Core(TM) i3-10110U CPU @ 2.10GHz",4,1000000,1000,1000000,215843,21.58,0.405615,0.405615,0.405615,0.405615,1
+2025-12-09 14:08:42,"Intel(R) Core(TM) i3-10110U CPU @ 2.10GHz",4,1000000,1000,1000000,215843,21.58,0.380290,0.380290,0.380290,0.380290,1
+2025-12-09 14:08:56,"Intel(R) Core(TM) i3-10110U CPU @ 2.10GHz",4,100000,316,99856,21595,21.63,0.070277,0.047735,0.143636,0.070277,10
