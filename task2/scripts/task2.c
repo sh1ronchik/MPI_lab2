@@ -20,6 +20,9 @@
 #define DT 0.01        /* Шаг по времени (секунды) - можно менять для точности */
 #define OUTPUT_STEP 10 /* Записывать каждый N-ый шаг (для уменьшения размера файла) */
 
+/* Мелкая константа для предотвращения деления на ноль при близких вкладах */
+#define SOFTENING 1e-9
+
 /* --- Утилиты работы с файловой системой --- */
 void ensure_dir_exists(const char *path) {
     char tmp[512];
@@ -123,65 +126,99 @@ int read_bodies(const char *filename, Body **bodies, int *n) {
 
 /* --- Вычисление сил между всеми телами --- */
 /* Использует третий закон Ньютона: Fpq = -Fqp для оптимизации */
-void compute_forces(Body *bodies, int n, double *fx, double *fy, double *fz) {
-    /* Обнуляем силы */
+void compute_forces(Body *bodies, int n, double *fx, double *fy, double *fz,
+                    double *fx_all, double *fy_all, double *fz_all, int nthreads) {
+
+    /* Обнуляем глобальные силы (глобальный буфер результата) */
     for (int i = 0; i < n; i++) {
         fx[i] = 0.0;
         fy[i] = 0.0;
         fz[i] = 0.0;
     }
-    
-    /* Вычисляем силы между всеми парами тел */
-    /* Используем симметрию: сила на q от k равна минус силе на k от q */
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (int q = 0; q < n; q++) {
-        double fx_local = 0.0;
-        double fy_local = 0.0;
-        double fz_local = 0.0;
-        
-        for (int k = 0; k < n; k++) {
-            if (k == q) continue;
-            
-            /* Вектор от q к k */
-            double dx = bodies[k].x - bodies[q].x;
-            double dy = bodies[k].y - bodies[q].y;
-            double dz = bodies[k].z - bodies[q].z;
-            
-            /* Расстояние между телами */
-            double r_sq = dx*dx + dy*dy + dz*dz;
-            double r = sqrt(r_sq);
-            double r_cubed = r_sq * r;
-            
-            /* Избегаем деления на ноль при очень близких телах */
-            if (r < 1e-10) continue;
-            
-            /* Сила притяжения: F = G * mq * mk / |r|^3 * (r_k - r_q) */
-            double force_factor = G * bodies[q].mass * bodies[k].mass / r_cubed;
-            
-            fx_local += force_factor * dx;
-            fy_local += force_factor * dy;
-            fz_local += force_factor * dz;
+
+    size_t per_thread = (size_t)n;
+
+    /* Однократная параллельная область: вычисление + редукция внутри */
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        double *fx_loc = fx_all + (size_t)tid * per_thread;
+        double *fy_loc = fy_all + (size_t)tid * per_thread;
+        double *fz_loc = fz_all + (size_t)tid * per_thread;
+
+        /* Сбрасываем локальную область */
+        memset(fx_loc, 0, per_thread * sizeof(double));
+        memset(fy_loc, 0, per_thread * sizeof(double));
+        memset(fz_loc, 0, per_thread * sizeof(double));
+
+        /* Вычисляем вклады пар (i,j) в локальные буферы — третий закон Ньютона соблюдается */
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n - 1; i++) {
+            double xi = bodies[i].x;
+            double yi = bodies[i].y;
+            double zi = bodies[i].z;
+            double mi = bodies[i].mass;
+
+            for (int j = i + 1; j < n; j++) {
+                double dx = bodies[j].x - xi;
+                double dy = bodies[j].y - yi;
+                double dz = bodies[j].z - zi;
+
+                double r_sq = dx*dx + dy*dy + dz*dz + SOFTENING;
+                double inv_r = 1.0 / sqrt(r_sq);
+                double inv_r3 = inv_r * inv_r * inv_r;
+
+                double force_factor = G * mi * bodies[j].mass * inv_r3;
+
+                double Fx = force_factor * dx;
+                double Fy = force_factor * dy;
+                double Fz = force_factor * dz;
+
+                fx_loc[i] += Fx;
+                fy_loc[i] += Fy;
+                fz_loc[i] += Fz;
+
+                fx_loc[j] -= Fx;
+                fy_loc[j] -= Fy;
+                fz_loc[j] -= Fz;
+            }
+        } /* end omp for (compute) */
+
+        /* Барьер — все потоки закончили записывать в свои локальные буферы */
+        #pragma omp barrier
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; i++) {
+            double sfx = 0.0, sfy = 0.0, sfz = 0.0;
+            size_t base = (size_t)i;
+            for (int t = 0; t < nthreads; t++) {
+                size_t idx = (size_t)t * per_thread + base;
+                sfx += fx_all[idx];
+                sfy += fy_all[idx];
+                sfz += fz_all[idx];
+            }
+            fx[i] = sfx;
+            fy[i] = sfy;
+            fz[i] = sfz;
         }
-        
-        fx[q] = fx_local;
-        fy[q] = fy_local;
-        fz[q] = fz_local;
-    }
+    } 
 }
+
+
 
 /* --- Обновление позиций и скоростей методом Эйлера --- */
 void update_bodies(Body *bodies, int n, double *fx, double *fy, double *fz, double dt) {
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; i++) {
-        /* Обновляем скорости: v^n = v^(n-1) + F^(n-1)/m * dt */
-        bodies[i].vx += (fx[i] / bodies[i].mass) * dt;
-        bodies[i].vy += (fy[i] / bodies[i].mass) * dt;
-        bodies[i].vz += (fz[i] / bodies[i].mass) * dt;
-        
         /* Обновляем позиции: x^n = x^(n-1) + v^(n-1) * dt */
         bodies[i].x += bodies[i].vx * dt;
         bodies[i].y += bodies[i].vy * dt;
         bodies[i].z += bodies[i].vz * dt;
+
+        /* Обновляем скорости: v^n = v^(n-1) + F^(n-1)/m * dt */
+        bodies[i].vx += (fx[i] / bodies[i].mass) * dt;
+        bodies[i].vy += (fy[i] / bodies[i].mass) * dt;
+        bodies[i].vz += (fz[i] / bodies[i].mass) * dt;
     }
 }
 
@@ -270,6 +307,23 @@ double simulate_nbody(Body *bodies, int n, double tend, double dt,
         write_snapshot(f, 0.0, bodies, n);
     }
     
+    /* Добавляем: выделяем пер-поточные буферы один раз (не каждый шаг) */
+    int nthreads_runtime = omp_get_max_threads();
+    size_t per_thread = (size_t)n;
+    size_t total_elems = (size_t)nthreads_runtime * per_thread;
+
+    double *fx_all = (double*)malloc(total_elems * sizeof(double));
+    double *fy_all = (double*)malloc(total_elems * sizeof(double));
+    double *fz_all = (double*)malloc(total_elems * sizeof(double));
+    if (!fx_all || !fy_all || !fz_all) {
+        fprintf(stderr, "Error: Failed to allocate per-thread buffers (n=%d, nthreads=%d)\n", n, nthreads_runtime);
+        free(fx_all); free(fy_all); free(fz_all);
+        free(fx); free(fy); free(fz);
+        if (f) fclose(f);
+        return -1.0;
+    }
+
+
     /* Запускаем таймер */
     double start_time = omp_get_wtime();
     
@@ -278,7 +332,7 @@ double simulate_nbody(Body *bodies, int n, double tend, double dt,
         double t = step * dt;
         
         /* Вычисляем силы */
-        compute_forces(bodies, n, fx, fy, fz);
+        compute_forces(bodies, n, fx, fy, fz, fx_all, fy_all, fz_all, nthreads_runtime);;
         
         /* Обновляем позиции и скорости */
         update_bodies(bodies, n, fx, fy, fz, dt);
@@ -292,6 +346,10 @@ double simulate_nbody(Body *bodies, int n, double tend, double dt,
     /* Останавливаем таймер */
     double end_time = omp_get_wtime();
     double elapsed = end_time - start_time;
+       
+    free(fx_all);
+    free(fy_all);
+    free(fz_all);
     
     if (f) fclose(f);
     free(fx); free(fy); free(fz);
